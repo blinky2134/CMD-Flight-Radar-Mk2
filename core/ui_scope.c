@@ -181,7 +181,7 @@ static void ground_paint(const ui_t *u, uint32_t *col, uint8_t *lev)
     };
     /* the land a whisper, water darker than it, the towns and roads brighter, motorways and
      * runways in the colour of what you read first. names are painted as the land: gone */
-    static const uint8_t LEV[M_CLASSES] = { 14, 0, 34, 24, 46, 62, 66, 100, 120, 110, 95, 14, 140 };
+    static const uint8_t LEV[M_CLASSES] = { 14, 0, 34, 24, 46, 62, 80, 115, 130, 125, 110, 14, 150 };
     for (int i = 0; i < M_CLASSES; i++) {
         if (u->cfg.look == LOOK_CLASSIC) {
             col[i] = RGB(CLASSIC[i][0], CLASSIC[i][1], CLASSIC[i][2]);
@@ -223,7 +223,7 @@ static ALWAYS_INLINE void disc_pass(ui_t *u, canvas_t *cv, const int radar, cons
         gmv = m->h * 32768;
         ground_paint(u, gcol, glev);
         for (int i = 0; i < M_CLASSES; i++)
-            gpaint[i] = classic ? gcol[i] : gfx_scale(gcol[i], radar ? glev[i] * 110u >> 8 : glev[i]);
+            gpaint[i] = classic ? gcol[i] : gfx_scale(gcol[i], radar ? glev[i] * 130u >> 8 : glev[i]);
         for (int i = 0; i <= 256; i++) {               // the radar's ground: lit by the beam, then fading
             int f = 256 - i;
             echo_lut[i] = (uint8_t)(110 + (146 * f * f >> 16));
