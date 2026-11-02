@@ -93,6 +93,12 @@ typedef struct {
 } spot_t;
 
 typedef struct {
+    uint32_t icao;
+    float x, y;             /* last position detected by the beam, km from home */
+    uint8_t seen, valid;
+} echo_t;
+
+typedef struct {
     uint32_t now, boot;    /* boot: when ui_init ran */
     sky_t    snap;         /* copy of the sky for this frame */
     fr_cfg_t cfg;
@@ -100,9 +106,11 @@ typedef struct {
     int      view, theme;
     uint32_t sel;          /* the picked plane's address, 0 none */
     spot_t   spot[SKY_MAX];
+    echo_t   echo[SKY_MAX]; /* held radar echoes, keyed by aircraft address */
     uint8_t  order[SKY_MAX];   /* nearest first */
     int      n_order;
-    float    beam;         /* the sweep, degrees */
+    float    beam, beam_prev; /* the sweep and its previous angle, degrees */
+    uint8_t  beam_ready;
     int      list_scroll, setup_scroll;
     /* touch */
     int      t_down, t_x0, t_y0, t_x, t_y, t_moved, t_long, t_ns, t_hit, t_reps, t_rpt, t_scroll0;

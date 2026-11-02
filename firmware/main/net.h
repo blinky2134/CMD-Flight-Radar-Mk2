@@ -6,9 +6,11 @@
 // how the board names itself to every server: OSM asks for a name it can tell apart
 #define NET_USER_AGENT "OWLOS-Flight-Radar/0.2 (+https://github.com/KirinDenis/OWLOS-FLIGHT-RADAR)"
 
-void net_start(const secrets_t *s);          // nothing happens without an SSID
+void net_start(const secrets_t *s, const wifi_profiles_t *profiles);
 void net_reconnect(const secrets_t *s);      // new WiFi settings, from the site or the screen
+void net_set_profiles(const wifi_profiles_t *profiles);
 int  net_up(void);                           // 1 = connected, has an address
+void net_connected_ssid(char *buf, int cap);
 int  net_why(void);                          // WHY_*: the network set is not up because
 void net_ip(char *buf, int cap);
 /* the screen's WiFi page: look round for networks. request starts it, poll (each frame) gets

@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -14,6 +15,9 @@ static const char *TAG = "net";
 static volatile int s_up, s_why;
 static char s_ip[16];
 static int s_started, s_have_ssid;
+static wifi_profiles_t s_profiles;
+static int s_profile_idx;
+static char s_connected_ssid[33];
 
 /* looking round for networks, for the screen's WiFi page. the driver will not look while it is
  * joining, and with a network set that is not there it joins every two seconds: the joining
@@ -23,6 +27,8 @@ static uint32_t     s_scan_asked, s_scan_try;
 static ap_t         s_aps[UI_APS];
 static int          s_naps;
 static portMUX_TYPE s_scan_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void apply(const secrets_t *s);
 
 static void scan_collect(int ok)
 {
@@ -77,7 +83,15 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 reason == WIFI_REASON_HANDSHAKE_TIMEOUT ? WHY_PASSWORD : WHY_NOT_FOUND;
         ESP_LOGW(TAG, "WiFi lost (reason %d), trying again", reason);
         vTaskDelay(pdMS_TO_TICKS(2000));              // the event task waits, the router gets a breath
-        if (s_have_ssid && s_scan != SCAN_RUNNING) esp_wifi_connect();
+        if (s_scan != SCAN_RUNNING && s_profiles.count) {
+            for (int tries = 0; tries < s_profiles.count; tries++) {
+                s_profile_idx = (s_profile_idx + 1) % s_profiles.count;
+                secrets_t next = { 0 };
+                snprintf(next.ssid, sizeof next.ssid, "%s", s_profiles.items[s_profile_idx].ssid);
+                snprintf(next.pass, sizeof next.pass, "%s", s_profiles.items[s_profile_idx].pass);
+                if (next.ssid[0]) { apply(&next); esp_wifi_connect(); break; }
+            }
+        } else if (s_have_ssid && s_scan != SCAN_RUNNING) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
         const wifi_event_sta_scan_done_t *e = data;
         scan_collect(e && e->status == 0);
@@ -85,6 +99,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *e = data;
         snprintf(s_ip, sizeof s_ip, IPSTR, IP2STR(&e->ip_info.ip));
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+            snprintf(s_connected_ssid, sizeof s_connected_ssid, "%s", (const char *)ap.ssid);
         s_up = 1;
         s_why = WHY_NONE;
         ESP_LOGI(TAG, "WiFi up, %s", s_ip);
@@ -149,7 +166,7 @@ static void apply(const secrets_t *s)
     esp_wifi_set_config(WIFI_IF_STA, &wc);
 }
 
-void net_start(const secrets_t *s)
+void net_start(const secrets_t *s, const wifi_profiles_t *profiles)
 {
     if (s_started) return;
     s_started = 1;
@@ -161,22 +178,67 @@ void net_start(const secrets_t *s)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));    // our NVS keeps the settings, not the driver's
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    apply(s);
+    if (profiles) s_profiles = *profiles;
+    if (s_profiles.count > WIFI_PROFILES_MAX) s_profiles.count = WIFI_PROFILES_MAX;
+    esp_netif_create_default_wifi_ap();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    wifi_config_t ap = { 0 };
+    snprintf((char *)ap.ap.ssid, sizeof ap.ap.ssid, "OWLOS-Setup");
+    ap.ap.ssid_len = (uint8_t)strlen((char *)ap.ap.ssid);
+    ap.ap.channel = 1;
+    ap.ap.max_connection = 3;
+    ap.ap.authmode = WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+    if (s_profiles.count) {
+        s_profile_idx = 0;
+        secrets_t first = { 0 };
+        snprintf(first.ssid, sizeof first.ssid, "%s", s_profiles.items[0].ssid);
+        snprintf(first.pass, sizeof first.pass, "%s", s_profiles.items[0].pass);
+        apply(&first);
+    } else apply(s);
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG, "WiFi started, network \"%s\"", s->ssid);
 }
 
 void net_reconnect(const secrets_t *s)
 {
-    if (!s_started) { net_start(s); return; }
+    if (!s_started) { net_start(s, NULL); return; }
+    if (s->ssid[0]) {
+        int idx = -1;
+        for (int i = 0; i < s_profiles.count; i++)
+            if (!strcmp(s_profiles.items[i].ssid, s->ssid)) { idx = i; break; }
+        if (idx < 0 && s_profiles.count < WIFI_PROFILES_MAX) idx = s_profiles.count++;
+        if (idx >= 0) {
+            snprintf(s_profiles.items[idx].ssid, sizeof s_profiles.items[idx].ssid, "%s", s->ssid);
+            snprintf(s_profiles.items[idx].pass, sizeof s_profiles.items[idx].pass, "%s", s->pass);
+        }
+    }
+    s_profile_idx = 0;
     esp_wifi_disconnect();
     apply(s);
     if (s_have_ssid) esp_wifi_connect();
     ESP_LOGI(TAG, "WiFi settings changed, network \"%s\"", s->ssid);
 }
 
+void net_set_profiles(const wifi_profiles_t *profiles)
+{
+    if (!profiles || profiles->count > WIFI_PROFILES_MAX) return;
+    s_profiles = *profiles;
+    s_profile_idx = 0;
+    secrets_t first = { 0 };
+    if (s_profiles.count) {
+        snprintf(first.ssid, sizeof first.ssid, "%s", s_profiles.items[0].ssid);
+        snprintf(first.pass, sizeof first.pass, "%s", s_profiles.items[0].pass);
+    }
+    net_reconnect(&first);
+}
+
 int net_up(void) { return s_up; }
+
+void net_connected_ssid(char *buf, int cap)
+{
+    snprintf(buf, (size_t)cap, "%s", s_connected_ssid);
+}
 
 void net_ip(char *buf, int cap) { snprintf(buf, (size_t)cap, "%s", s_ip); }
 

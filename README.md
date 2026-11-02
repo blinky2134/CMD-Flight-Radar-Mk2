@@ -45,6 +45,11 @@ The map under them comes from OpenStreetMap.
 
 - On the 2.8" and 3.5" CYD: tap **SET UP WIFI** on the demo's card (or SET, the WIFI row), tap your
   network, type its password, JOIN.
+- From a phone or computer, join the open WiFi network **OWLOS-Setup**. Its setup page should open
+  by itself; if it does not, visit **http://192.168.4.1/**. Save up to five WiFi networks, each with
+  a UK town, address or postcode. When the board joins one, it looks up that place with OpenStreetMap
+  and centres the radar there. The page also changes the aircraft source and screen/map settings.
+  The setup network stays available so settings can be changed later.
 - From the site, step 2: the WiFi, your home point, where the planes come from and how the screen shows,
   sent over the same USB cable. The round board and the RPi LCD take their WiFi this way.
 - Till it gets a home the board sits in Trenčín, Slovakia. The plane network only hears the home rounded

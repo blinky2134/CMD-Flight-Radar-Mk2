@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "button.h"
+#include "cJSON.h"
 #include "console.h"
 #include "demo.h"
 #include "display.h"
@@ -19,6 +20,7 @@
 #include "map.h"
 #include "sky.h"
 #include "store.h"
+#include "setup_portal.h"
 #include "tiles.h"
 #include "touch.h"
 #include "ui.h"
@@ -44,6 +46,7 @@ static sky_t             s_sky;        // written by the fetch task, under s_loc
 static demo_t            s_demo;
 static fr_cfg_t          s_cfg;        // the settings in use: the screen changes them, the site too
 static secrets_t         s_sec;
+static wifi_profiles_t   s_profiles;
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t      s_fetch;
 static ui_t              s_ui;
@@ -83,6 +86,68 @@ static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 static uint32_t now_us(void) { return (uint32_t)esp_timer_get_time(); }
 static void lock(void) { xSemaphoreTake(s_lock, portMAX_DELAY); }
 static void unlock(void) { xSemaphoreGive(s_lock); }
+
+void setup_get_snapshot(fr_cfg_t *cfg, secrets_t *sec, wifi_profiles_t *profiles)
+{
+    lock();
+    if (cfg) *cfg = s_cfg;
+    if (sec) *sec = s_sec;
+    if (profiles) *profiles = s_profiles;
+    unlock();
+}
+
+int setup_save_snapshot(const fr_cfg_t *cfg, const secrets_t *sec, const wifi_profiles_t *profiles)
+{
+    if (!cfg || !sec || !profiles || profiles->count > WIFI_PROFILES_MAX) return 0;
+    fr_cfg_t c = *cfg;
+    secrets_t s = *sec;
+    wifi_profiles_t p = *profiles;
+    if (c.lat < -90 || c.lat > 90 || c.lon < -180 || c.lon > 180) return 0;
+    if (p.count) {
+        snprintf(s.ssid, sizeof s.ssid, "%s", p.items[0].ssid);
+        snprintf(s.pass, sizeof s.pass, "%s", p.items[0].pass);
+    } else {
+        s.ssid[0] = s.pass[0] = 0;
+    }
+    lock();
+    s_cfg = c;
+    s_sec = s;
+    s_profiles = p;
+    s_cfg_new = 1;
+    sky_home(&s_sky, c.lat, c.lon);
+    s_sky.n = 0;
+    s_sky.status = SKY_CONNECTING;
+    s_wifi_try = now_ms();
+    unlock();
+    store_save_cfg(&c);
+    store_save_secrets(&s);
+    store_save_profiles(&p);
+    net_set_profiles(&p);
+    if (s_fetch) xTaskNotifyGive(s_fetch);
+    return 1;
+}
+
+void setup_set_screen(int screen)
+{
+    if (screen >= 0 && screen < LCD_PROFILES) s_screen_set = screen;
+}
+
+void setup_apply_location(float lat, float lon)
+{
+    fr_cfg_t c;
+    lock();
+    c = s_cfg;
+    c.lat = lat;
+    c.lon = lon;
+    c.place[0] = c.country[0] = 0;        // resolve a fresh town and country for the new home
+    s_cfg = c;
+    s_cfg_new = 1;
+    sky_home(&s_sky, lat, lon);
+    unlock();
+    store_save_cfg(&c);
+    if (s_fetch) xTaskNotifyGive(s_fetch);
+    ESP_LOGI(TAG, "location saved from setup page: %.5f %.5f", (double)lat, (double)lon);
+}
 
 /* --- asking the server --- */
 
@@ -228,6 +293,118 @@ static void geocode(void)
     if (same) store_save_cfg(&c);
 }
 
+static void copy_profile_name(char *out, size_t cap, const char *in)
+{
+    size_t i = 0, n = 0;
+    while (in[i] && n + 1 < cap) {
+        unsigned char c = (unsigned char)in[i];
+        size_t len = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc2 ? 2 : 1;
+        if (n + len >= cap) break;
+        int valid = 1;
+        for (size_t k = 1; k < len; k++)
+            if (!in[i + k] || ((unsigned char)in[i + k] & 0xc0) != 0x80) valid = 0;
+        if (!valid) len = 1;
+        memcpy(out + n, in + i, len);
+        n += len;
+        i += len;
+    }
+    out[n] = 0;
+}
+
+static void apply_profile_home(const wifi_profile_t *p)
+{
+    fr_cfg_t c;
+    char place[40];
+    copy_profile_name(place, sizeof place, p->location);
+    lock();
+    c = s_cfg;
+    if (c.lat == p->lat && c.lon == p->lon && !strcmp(c.place, place) && !strcmp(c.country, "UK")) { unlock(); return; }
+    c.lat = p->lat;
+    c.lon = p->lon;
+    snprintf(c.place, sizeof c.place, "%s", place);
+    snprintf(c.country, sizeof c.country, "UK");
+    s_cfg = c;
+    s_cfg_new = 1;
+    sky_home(&s_sky, c.lat, c.lon);
+    s_sky.n = 0;
+    unlock();
+    store_save_cfg(&c);
+    ESP_LOGI(TAG, "home for this WiFi: %s, %.5f %.5f", p->location, (double)p->lat, (double)p->lon);
+}
+
+static void resolve_profile_home(void)
+{
+    char ssid[33];
+    net_connected_ssid(ssid, sizeof ssid);
+    if (!ssid[0]) return;
+    wifi_profiles_t profiles;
+    lock();
+    profiles = s_profiles;
+    unlock();
+    int idx = -1;
+    for (int i = 0; i < profiles.count; i++)
+        if (!strcmp(profiles.items[i].ssid, ssid)) { idx = i; break; }
+    if (idx < 0 || !profiles.items[idx].location[0]) return;
+    wifi_profile_t *p = &profiles.items[idx];
+    if (p->resolved) { apply_profile_home(p); return; }
+
+    static char tried_ssid[33], tried_location[81];
+    static uint32_t tried_at;
+    uint32_t now = now_ms();
+    if (!strcmp(tried_ssid, ssid) && !strcmp(tried_location, p->location) && now - tried_at < 300000u) return;
+    snprintf(tried_ssid, sizeof tried_ssid, "%s", ssid);
+    snprintf(tried_location, sizeof tried_location, "%s", p->location);
+    tried_at = now;
+
+    static const char hex[] = "0123456789ABCDEF";
+    char query[241], url[420];
+    size_t n = 0;
+    for (const unsigned char *ch = (const unsigned char *)p->location; *ch && n + 4 < sizeof query; ch++) {
+        if ((*ch >= 'a' && *ch <= 'z') || (*ch >= 'A' && *ch <= 'Z') || (*ch >= '0' && *ch <= '9') ||
+            *ch == '-' || *ch == '_' || *ch == '.' || *ch == '~') query[n++] = (char)*ch;
+        else { query[n++] = '%'; query[n++] = hex[*ch >> 4]; query[n++] = hex[*ch & 15]; }
+    }
+    query[n] = 0;
+    snprintf(url, sizeof url, "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=gb&q=%s", query);
+    static char response[2048];
+    text_t sink = { response, 0, sizeof response };
+    response[0] = 0;
+    int status = 0;
+    net_get(url, NULL, to_text, &sink, &status);
+    cJSON *root = cJSON_Parse(response);
+    cJSON *result = cJSON_IsArray(root) ? cJSON_GetArrayItem(root, 0) : NULL;
+    cJSON *lat_json = result ? cJSON_GetObjectItemCaseSensitive(result, "lat") : NULL;
+    cJSON *lon_json = result ? cJSON_GetObjectItemCaseSensitive(result, "lon") : NULL;
+    char *end_lat = NULL, *end_lon = NULL;
+    float lat = lat_json && cJSON_IsString(lat_json) ? strtof(lat_json->valuestring, &end_lat) : NAN;
+    float lon = lon_json && cJSON_IsString(lon_json) ? strtof(lon_json->valuestring, &end_lon) : NAN;
+    if (!end_lat || *end_lat || !end_lon || *end_lon) lat = lon = NAN;
+    int valid = status == 200 && isfinite(lat) && isfinite(lon) && lat >= 49.8f && lat <= 60.9f && lon >= -8.7f && lon <= 1.9f;
+    if (valid) {
+        wifi_profiles_t saved_profiles;
+        wifi_profile_t saved_profile;
+        int save = 0;
+        lock();
+        if (idx < s_profiles.count && !strcmp(s_profiles.items[idx].ssid, ssid) &&
+            !strcmp(s_profiles.items[idx].location, tried_location)) {
+            s_profiles.items[idx].lat = lat;
+            s_profiles.items[idx].lon = lon;
+            s_profiles.items[idx].resolved = 1;
+            saved_profile = s_profiles.items[idx];
+            saved_profiles = s_profiles;
+            save = 1;
+        }
+        unlock();
+        if (save) {
+            store_save_profiles(&saved_profiles);
+            apply_profile_home(&saved_profile);
+        }
+    } else {
+        ESP_LOGW(TAG, "OpenStreetMap could not find UK location '%s' (HTTP %d); will retry later", tried_location, status);
+    }
+    cJSON_Delete(root);
+}
+
 static void fetch_task(void *arg)
 {
     (void)arg;
@@ -248,6 +425,10 @@ static void fetch_task(void *arg)
         map_service(&c);                              // first: a new look or range shows its map before the planes come
         uint32_t every = FREE_EVERY_MS;
         const int up = net_up();
+        if (up) {
+            resolve_profile_home();
+            lock(); c = s_cfg; unlock();
+        }
         int trying = 0;
         if (configured && !up) {
             uint32_t now = now_ms();
@@ -771,6 +952,14 @@ void app_main(void)
     s_lock = xSemaphoreCreateMutex();
     if (!store_load_cfg(&s_cfg)) fr_cfg_defaults(&s_cfg);
     store_load_secrets(&s_sec);
+    if (!store_load_profiles(&s_profiles) || !s_profiles.count) {
+        if (s_sec.ssid[0]) {
+            s_profiles.count = 1;
+            snprintf(s_profiles.items[0].ssid, sizeof s_profiles.items[0].ssid, "%s", s_sec.ssid);
+            snprintf(s_profiles.items[0].pass, sizeof s_profiles.items[0].pass, "%s", s_sec.pass);
+            store_save_profiles(&s_profiles);
+        }
+    }
     s_demo_on = !s_sec.ssid[0];                         // no WiFi set: the demo from the first frame
     sky_init(&s_sky, s_cfg.lat, s_cfg.lon);
     demo_init(&s_demo, range_km(&s_cfg), esp_random());
@@ -778,10 +967,11 @@ void app_main(void)
     tiles_init();
     map_mem = iram_first;
     console_start(on_line);
-    net_start(&s_sec);                                 // up even without settings: a SET then just connects
+    net_start(&s_sec, &s_profiles);                    // saved networks are tried in turn
     /* the TLS handshake runs on the fetch task, and the map is made there. one core (the C3): it
      * gets the screen's priority, the two take turns a tick each. under the screen it had less
      * than a millisecond a frame, a map took it over ten seconds and IDLE starved into the watchdog */
     xTaskCreatePinnedToCore(fetch_task, "fetch", 12288, NULL, portNUM_PROCESSORS > 1 ? 4 : 5, &s_fetch, 0);
     xTaskCreatePinnedToCore(ui_task, "ui", 8192, NULL, 5, NULL, portNUM_PROCESSORS > 1 ? 1 : 0);
+    setup_portal_start();
 }

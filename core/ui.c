@@ -376,7 +376,9 @@ void ui_set_cfg(ui_t *u, const fr_cfg_t *c)
 void ui_frame(ui_t *u, uint32_t now)
 {
     u->now = now;
+    u->beam_prev = u->beam;
     u->beam = wrap360((float)(now % 6000u) * 0.06f);        // a turn in 6 s
+    if (!u->beam_ready) { u->beam_prev = u->beam; u->beam_ready = 1; }
     if (u->sel && !sel_plane(u)) u->sel = 0;                // it flew away
     scope_frame(u);
 }

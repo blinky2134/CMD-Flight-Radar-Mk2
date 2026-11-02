@@ -91,6 +91,26 @@ void store_save_secrets(const secrets_t *s)
     nvs_close(h);
 }
 
+int store_load_profiles(wifi_profiles_t *p)
+{
+    memset(p, 0, sizeof *p);
+    if (!load_blob(NS, "wifi_profiles", p, sizeof *p) || p->count > WIFI_PROFILES_MAX) {
+        memset(p, 0, sizeof *p);
+        return 0;
+    }
+    for (int i = 0; i < p->count; i++) {
+        p->items[i].ssid[sizeof p->items[i].ssid - 1] = 0;
+        p->items[i].pass[sizeof p->items[i].pass - 1] = 0;
+        p->items[i].location[sizeof p->items[i].location - 1] = 0;
+    }
+    return 1;
+}
+
+void store_save_profiles(const wifi_profiles_t *p)
+{
+    if (p->count <= WIFI_PROFILES_MAX) save_blob("wifi_profiles", p, sizeof *p);
+}
+
 /* a board that ran the WiFi radar or the thermostat already knows its touch: same chip, same
  * panel. so without an alignment of its own it takes theirs */
 int store_load_cal(touch_cal_t *cal)

@@ -441,12 +441,44 @@ void scope_frame(ui_t *u)
     }
     float range = range_km(&u->cfg);
     int sel = -1;
+    for (int i = 0; i < SKY_MAX; i++) {
+        echo_t *echo = &u->echo[i];
+        echo->seen = 0;
+        if (!echo->valid) continue;
+        for (int j = 0; j < s->n; j++) if (s->p[j].icao == echo->icao) { echo->seen = 1; break; }
+    }
+    float beam_step = wrap360(u->beam - u->beam_prev);
     for (int k = 0; k < u->n_order; k++) {
         int i = u->order[k];
         const plane_t *p = &s->p[i];
         spot_t *sp = &u->spot[i];
         float x, y, sx, sy;
         plane_now(p, u->now, &x, &y);
+        echo_t *echo = NULL;
+        for (int e = 0; e < SKY_MAX; e++) {
+            if (u->echo[e].valid && u->echo[e].icao == p->icao) { echo = &u->echo[e]; break; }
+        }
+        if (!echo) {
+            for (int e = 0; e < SKY_MAX; e++) if (!u->echo[e].seen) { echo = &u->echo[e]; break; }
+            if (echo) {
+                echo->icao = p->icao;
+                echo->x = x; echo->y = y;
+                echo->valid = 1;
+            }
+        }
+        if (echo) {
+            echo->seen = 1;
+            if (u->cfg.look != LOOK_RADAR) {
+                echo->x = x; echo->y = y;
+            } else if (beam_step > 0.0f) {
+                float tx, ty;
+                to_screen(u, x, y, &tx, &ty);
+                float bearing = wrap360(atan2f(tx - (float)SCX, (float)SCY - ty) / D2R);
+                float to_bearing = wrap360(bearing - u->beam_prev);
+                if (to_bearing <= beam_step) { echo->x = x; echo->y = y; }
+            }
+            x = echo->x; y = echo->y;
+        }
         to_screen(u, x, y, &sx, &sy);
         float d = sqrtf(x * x + y * y);
         sp->lw = 0;
@@ -724,7 +756,7 @@ static void grid_frame(ui_t *u)
 {
     s_ngrid = 0;
     const fr_cfg_t *c = &u->cfg;
-    if (u->view != VIEW_MAIN || c->look == LOOK_RADAR) return;
+    if (u->view != VIEW_MAIN || c->look == LOOK_RADAR || ground(u)) return;
     const float R = range_km(c) * 1.05f, cl = cosf(c->lat * D2R);
     const float sd = grid_step(u) / 60.0f, r = (float)PR - 1.0f;
     // parallels: a latitude is a distance north, straight across. named at the east end
@@ -847,7 +879,7 @@ static void grid_frame(ui_t *u)
 {
     s_ngrid = 0;
     const fr_cfg_t *c = &u->cfg;
-    if (u->view != VIEW_MAIN || !square_look(u)) return;
+    if (u->view != VIEW_MAIN || !square_look(u) || ground(u)) return;
     const float k = k_px(u), sd = grid_step(u) / 60.0f;
     const int cx = view_cx(u);
     // parallels: straight across, named at the left edge
